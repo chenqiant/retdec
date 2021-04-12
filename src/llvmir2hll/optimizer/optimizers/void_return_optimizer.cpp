@@ -55,7 +55,10 @@ void VoidReturnOptimizer::visit(ShPtr<ReturnStmt> stmt) {
 	if (nestingLevel > 0) {
 		return;
 	}
-
+	//还有一种可能，就是return 之后的代码仍然可以运行的，如果不return ,就会出现继续往下运行了
+	if (stmt->hasSuccessor()){
+		return;
+	}
 	// The statement can be optimized.
 	Statement::removeStatement(stmt);
 }
