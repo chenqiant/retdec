@@ -100,10 +100,18 @@
 #include "retdec/llvmir2hll/support/struct_types_sorter.h"
 #include "retdec/llvmir2hll/support/types.h"
 #include "retdec/llvmir2hll/utils/ir.h"
+#include "retdec/llvm-support/diagnostics.h"
 #include "retdec/utils/container.h"
 #include "retdec/utils/conversion.h"
+#include <cxxabi.h>
+#include <string>
+#include "../../../llvmir2hlltool/outputfiletype.h"
+std::string outputfiletype;
+using namespace std;
+using namespace retdec::llvm_support;
 
 using retdec::utils::addToSet;
+using retdec::utils::toString;
 
 namespace retdec {
 namespace llvmir2hll {
@@ -113,6 +121,33 @@ REGISTER_AT_FACTORY("c", C_HLL_WRITER_ID, HLLWriterFactory, CHLLWriter::create);
 namespace {
 /// Prefix of comments in C.
 const std::string COMMENT_PREFIX = "//";
+
+std::string str_del_char(char* str)
+{	std::string str2 = std::string(str);
+	int pos = str2.find('(');
+	str2.erase(pos,-1);
+	//printf("%s\n",str2.c_str());
+	return str2.c_str();
+}
+char * res;
+
+int status;
+std::vector<std::string> statV;  
+std::vector<std::string> timevalV;  
+std::string demangle(std::string funcName){
+	res = abi::__cxa_demangle(funcName.c_str(), 0, 0, &status);   //demangle
+	//printf("&funcName:%s\n",funcName.c_str());
+	if (res){  //如果返回不是空指针，就得到demangle之后
+			//printf("res:%s\n",res);
+			//res2 = str_del_char(res);
+			//printf("res2:%s",res2);
+			return str_del_char(res);  //此时返回的函数名有着括号，需要去掉括号及其内的字符串	
+			
+		}
+	//printf("funcName2:%s\n",funcName.c_str());
+
+	return funcName;
+}
 
 /**
 * @brief Returns a valid version of the given identifier.
@@ -241,7 +276,7 @@ CHLLWriter::CHLLWriter(llvm::raw_ostream &o, const std::string& outputFormat):
 	HLLWriter(o, outputFormat),
 	unnamedStructCounter(0),
 	emittingGlobalVarDefs(false),
-	optionEmitFunctionPrototypesForNonLibraryFuncs(false)
+	optionEmitFunctionPrototypesForNonLibraryFuncs(true)
 {
 	out->setCommentPrefix(getCommentPrefix());
 	out->setOutputLanguage("C");
@@ -304,6 +339,7 @@ bool CHLLWriter::emitFileHeader() {
 		headerFiles.insert("stdlib.h");
 	}
 
+	
 	// Include headers for linked functions.
 	addToSet(HeadersForDeclaredFuncs::getHeaders(module), headerFiles);
 
@@ -442,6 +478,11 @@ bool CHLLWriter::emitFileHeader() {
 	}
 	for (const auto &type : usedStructTypes) {
 		out->newLine();
+		//cq add 当这两个文件表示结构体在外部文件中出现了，不要生成，否则会造成多重定义 解决多重定义 的问题
+		if (type->getName().compare("_IO_FILE") == 0 || type->getName().compare("_IO_marker") == 0 
+			|| type->getName().compare("timespec") == 0 || type->getName().compare("stat") == 0
+			|| type->getName().compare("timeval") == 0)
+			continue;
 		emitStructDeclaration(type);
 		out->punctuation(';');
 		out->newLine();
@@ -505,37 +546,44 @@ void CHLLWriter::visit(ShPtr<GlobalVarDef> varDef) {
 	ShPtr<Variable> var(varDef->getVar());
 	ShPtr<Expression> init(varDef->getInitializer());
 
-	out->addressPush(varDef->getAddress());
 	out->space(getCurrentIndent());
-	emitVarWithType(var);
+	out->addressPush(varDef->getAddress());
+	//cq add if do nothing
+	// var->getName().compare("cl_errs") == 0
+	if (var->getName().compare("stderr") == 0 ||var->getName().compare("stdout") == 0){
+		
+	}
+	else {
+		emitVarWithType(var);
 
-	// Initializer.
-	if (init) {
-		emitConstantsInStructuredWay = true;
-		if (ShPtr<ConstArray> constArrayInit = cast<ConstArray>(init)) {
-			if (constArrayInit->isInitialized()) {
+		// Initializer.
+		if (init) {
+			emitConstantsInStructuredWay = true;
+			if (ShPtr<ConstArray> constArrayInit = cast<ConstArray>(init)) {
+				if (constArrayInit->isInitialized()) {
+					out->operatorX("=", true, true);
+
+					emitInitializedConstArray(constArrayInit);
+				}
+			} else if (ShPtr<ConstStruct> constStructInit = cast<ConstStruct>(init)) {
 				out->operatorX("=", true, true);
 
-				emitInitializedConstArray(constArrayInit);
+				// When defining a structure, we do not need to emit a cast.
+				emitConstStruct(constStructInit, false);
+			} else {
+				out->operatorX("=", true, true);
+				init->accept(this);
 			}
-		} else if (ShPtr<ConstStruct> constStructInit = cast<ConstStruct>(init)) {
-			out->operatorX("=", true, true);
-
-			// When defining a structure, we do not need to emit a cast.
-			emitConstStruct(constStructInit, false);
-		} else {
-			out->operatorX("=", true, true);
-			init->accept(this);
+			emitConstantsInStructuredWay = false;
 		}
-		emitConstantsInStructuredWay = false;
+
+		out->punctuation(';');
+
+		tryEmitVarInfoInComment(var);
+
+		out->addressPop();
+		out->newLine();
 	}
-
-	out->punctuation(';');
-
-	tryEmitVarInfoInComment(var);
-
-	out->addressPop();
-	out->newLine();
 }
 
 void CHLLWriter::visit(ShPtr<Function> func) {
@@ -564,22 +612,17 @@ bool CHLLWriter::emitTargetCode(ShPtr<Module> module) {
 
 void CHLLWriter::visit(ShPtr<Variable> var) {
 	if (var->getAddress().isDefined()) out->addressPush(var->getAddress());
-	if (module->isGlobalVar(var))
-	{
-		out->globalVariableId(var->getName());
-	}
-	else if (module->correspondsToFunc(var))
-	{
-		out->functionId(var->getName());
-	}
-	else
-	{
-		out->localVariableId(var->getName());
-	}
+	out->variableId(var->getName());
 	if (var->getAddress().isDefined()) out->addressPop();
 }
 
 void CHLLWriter::visit(ShPtr<AddressOpExpr> expr) {
+	//获取 变量名 与其对应的结构体的名称
+	if (expr->getType()->getTextRepr().compare("struct (stat)") == 0)
+		statV.push_back(expr->getTextRepr());
+	else if (expr->getType()->getTextRepr().compare("struct (timeval)") == 0)
+		timevalV.push_back(expr->getTextRepr());
+
 	emitUnaryOpExpr("&", expr);
 }
 
@@ -588,27 +631,52 @@ void CHLLWriter::visit(ShPtr<AssignOpExpr> expr) {
 }
 
 void CHLLWriter::visit(ShPtr<ArrayIndexOpExpr> expr) {
+	//当出现 *X[N] 时，需要加括号， (*X)[N]
+	bool ifNeedBracks = (expr->getTextRepr()[0] == '*');  
+	if (ifNeedBracks)
+		out->punctuation('(');
 	// Base.
 	emitExprWithBracketsIfNeeded(expr->getBase());
-
+	if (ifNeedBracks)
+		out->punctuation(')');
 	// Access.
 	out->punctuation('[');
 	expr->getIndex()->accept(this);
 	out->punctuation(']');
 }
 
+bool isInVector(std::vector<std::string> V, std::string S){
+	for(std::vector<std::string>::iterator I = V.begin(),E = V.end() ; I!=E ; I++){
+		if ((S).find(*I) != string::npos)
+			return true;
+	}
+	return false;
+}
 void CHLLWriter::visit(ShPtr<StructIndexOpExpr> expr) {
 	// Base.
 	ShPtr<Expression> base(expr->getFirstOperand());
 	emitExprWithBracketsIfNeeded(base);
-
+	
 	// Access.
 	isa<PointerType>(base->getType()) ? out->operatorX("->") : out->operatorX(".");
 
 	// Element.
 	assert(isa<ConstInt>(expr->getSecondOperand()));
 	ShPtr<ConstInt> ci = cast<ConstInt>(expr->getSecondOperand());
-	out->memberId("e" + ci->getTextRepr());
+	// 对于多重定义的结构体，因为我们要保留其中的头文件，所以需要去掉定义的结构体，所以对于其中的索引，要替换成需要的名称
+	std::string testS = expr->getFirstOperand()->getTextRepr();
+	if (isInVector(statV,testS)){
+		if (ci->getTextRepr().compare("8") == 0)
+			out->memberId("st_size");
+	}
+	else if (isInVector(timevalV,testS)){
+		if (ci->getTextRepr().compare("0") == 0)
+			out->memberId("tv_sec");
+		else if (ci->getTextRepr().compare("1") == 0)
+			out->memberId("tv_usec");
+	}
+	else
+		out->memberId("e" + ci->getTextRepr());
 }
 
 void CHLLWriter::visit(ShPtr<DerefOpExpr> expr) {
@@ -901,15 +969,29 @@ void CHLLWriter::emitInitVarDefWhenNeeded(ShPtr<UForLoopStmt> loop) {
 	out->space();
 }
 
+//在cpp情况下，需要将malloc的类型转换成 (char*) malloc
+void TransformMallocInCpp(ShPtr<VarDefStmt> stmt){
+	ShPtr<Expression> mallocExp = stmt->getInitializer();
+	ShPtr<BitCastExpr> BitCastExpr(BitCastExpr::create(
+		mallocExp, stmt->getVar()->getType()));
+	stmt->setInitializer(BitCastExpr);
+}
+
 // Only here is variables type emitted.
 void CHLLWriter::visit(ShPtr<VarDefStmt> stmt) {
+	if (ShPtr<Expression> init = stmt->getInitializer())
+		//cq add
+		if (stmt->getTextRepr().find("= malloc") != string::npos || stmt->getTextRepr().find("= calloc") != string::npos || stmt->getTextRepr().find("= alloc") != string::npos)
+			if (outputfiletype.find(".cpp") != string::npos)
+				TransformMallocInCpp(stmt);
+			// end
+
 	out->space(getCurrentIndent());
 	emitVarWithType(stmt->getVar());
 
 	// Initializer.
 	if (ShPtr<Expression> init = stmt->getInitializer()) {
 		out->operatorX("=", true, true);
-
 		emitConstantsInStructuredWay = true;
 		if (ShPtr<ConstStruct> constStruct = cast<ConstStruct>(init)) {
 			// When defining a structure, we do not need to emit a cast.
@@ -921,9 +1003,9 @@ void CHLLWriter::visit(ShPtr<VarDefStmt> stmt) {
 	}
 
 	out->punctuation(';');
-
+	
 	tryEmitVarInfoInComment(stmt->getVar(), stmt);
-
+	
 	out->newLine();
 }
 
@@ -1199,6 +1281,7 @@ void CHLLWriter::visit(ShPtr<StructType> type) {
 	// Named structures can be emitted by using their name, unnamed structures
 	// are emitted inline including their full type.
 	auto i = structNames.find(type);
+	
 	if (i != structNames.end()) {
 		// It has a name -> use it.
 		out->keyword("struct");
@@ -1286,7 +1369,7 @@ bool CHLLWriter::emitStandardFunctionPrototypes() {
 */
 bool CHLLWriter::emitFunctionPrototypesForNonLibraryFuncs() {
 	bool somethingEmitted = false;
-
+	std::vector<ShPtr<Function>> funcV;
 	for (auto i = module->func_declaration_begin(),
 			e = module->func_declaration_end(); i != e; ++i) {
 		if (HeadersForDeclaredFuncs::hasAssocHeader(module, *i)) {
@@ -1297,10 +1380,47 @@ bool CHLLWriter::emitFunctionPrototypesForNonLibraryFuncs() {
 			out->commentLine("The following linked functions do not have "
 				"any associated header file:");
 		}
-		emitFunctionPrototype(*i);
+
+		//cq add for extern c
+		// if ((*i)->getName().find("pb_") != string::npos || (*i)->getName().find("slave") != string::npos || ){
+		// 	funcV.push_back((*i));
+		// 	int j = 0;
+		// }
+		else if ((*i)->getName().compare("llvm_stacksave")==0 ||(*i)->getName().compare("llvm_stackrestore")==0 || (*i)->getName().compare("llvm_var_annotation")==0)
+			somethingEmitted = true;
+		else if ((*i)->getName().find("athread") == string::npos)  //不希望打出这个三个函数
+		{	emitFunctionPrototype(*i);
+			funcV.push_back((*i));
+		}
+			
+
 		somethingEmitted = true;
 	}
-
+	//打印 pb_*及 slave函数，他们需要包含在extern c之中 cq add
+	printf("%s\n",outputfiletype.c_str());
+	out->includeLine("stdarg.h", getCurrentIndent());
+	if (outputfiletype.find(".cpp") != string::npos && funcV.size()>0){
+		out->labelId("extern");
+		out->space();
+		out->labelId("\"C\"");
+		out->space();
+		out->newLine();
+		out->punctuation('{');
+		out->newLine();
+		out->includeLine("athread.h", getCurrentIndent());
+		for(int i = 0 ; i< funcV.size() ;i++){
+			ShPtr<Function> func = funcV[i];
+			emitFunctionPrototype(func);
+		}
+		out->punctuation('}');
+	} // 对于非cpp的文件，正常生成就可以了
+	else {
+		out->includeLine("athread.h", getCurrentIndent());
+		for(int i = 0 ; i< funcV.size() ;i++){
+			ShPtr<Function> func = funcV[i];
+			emitFunctionPrototype(func);
+		}
+	}
 	return somethingEmitted;
 }
 
@@ -1500,15 +1620,41 @@ void CHLLWriter::emitHeaderOfFuncReturningPointerToArray(ShPtr<Function> func) {
 void CHLLWriter::emitFunctionParameters(ShPtr<Function> func) {
 	// For each parameter...
 	bool paramEmitted = false;
-	for (const auto &param : func->getParams()) {
-		if (paramEmitted) {
-			out->operatorX(",");
+	//cq add
+	if (func->getName().compare("cl_errChk") == 0){
+		for (const auto &param : func->getParams()) {
+			if (paramEmitted) {
+				out->operatorX(",");
+				out->space();
+			}
+			out->dataType("const");
 			out->space();
+			emitVarWithType(param);
+			paramEmitted = true;
 		}
-		emitVarWithType(param);
-		paramEmitted = true;
 	}
-
+	else if (func->getName().compare("alloc") == 0){
+		for (const auto &param : func->getParams()) {
+			if (paramEmitted) {
+				out->operatorX(",");
+				out->space();
+			}
+			out->operatorX("u");   //alloc 需要uint64_t 而不是int64_t
+			emitVarWithType(param);
+			paramEmitted = true;
+		}
+	}
+	// end
+	else{
+		for (const auto &param : func->getParams()) {
+			if (paramEmitted) {
+				out->operatorX(",");
+				out->space();
+			}
+			emitVarWithType(param);
+			paramEmitted = true;
+		}
+	}
 	// Optional vararg indication.
 	if (func->isVarArg()) {
 		if (paramEmitted) {
@@ -1970,7 +2116,7 @@ void CHLLWriter::emitStructDeclaration(ShPtr<StructType> structType,
 		ShPtr<Type> elemType(elements.at(i));
 		// Create a dummy variable so we can use emitVarWithType().
 		// All elements are named e#, where # is a number.
-		emitVarWithType(Variable::create("e" + std::to_string(i), elemType));
+		emitVarWithType(Variable::create("e" + toString(i), elemType));
 		out->punctuation(';');
 		if (!emitInline) {
 			out->newLine();
@@ -2005,7 +2151,6 @@ void CHLLWriter::emitBlock(ShPtr<Statement> stmt) {
 	do {
 		out->addressPush(stmt->getAddress());
 		emitGotoLabelIfNeeded(stmt);
-
 		// Are there any metadata?
 		std::string metadata = stmt->getMetadata();
 		if (!metadata.empty()) {
@@ -2028,6 +2173,7 @@ void CHLLWriter::emitBlock(ShPtr<Statement> stmt) {
 * A label is needed if @a stmt is the target of a goto statement.
 */
 void CHLLWriter::emitGotoLabelIfNeeded(ShPtr<Statement> stmt) {
+	
 	if (stmt->isGotoTarget()) {
 		out->space(getIndentForGotoLabel());
 		out->labelId(getGotoLabel(stmt));
@@ -2102,7 +2248,7 @@ std::string CHLLWriter::genNameForUnnamedStruct(const StructTypeVector &usedStru
 	std::string structName;
 	// Create new names until we find a name without a clash.
 	do {
-		structName = "struct" + std::to_string(++unnamedStructCounter);
+		structName = "struct" + toString(++unnamedStructCounter);
 		for (const auto &type : usedStructTypes) {
 			if (cast<StructType>(type)->getName() == structName) {
 				// We have found a clash, so try a different name.
